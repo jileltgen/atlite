@@ -269,11 +269,8 @@ def retrieve_data(product, chunks=None, tmpdir=None, lock=None, **updates):
         logger.info(f"CDS: Downloading variables {varstr}\n")
         result.download(target)
 
-    try:
-        ds = xr.open_dataset(target, chunks=chunks or {})
-    finally:
-        ds.close()
     ds = xr.open_dataset(target, chunks=chunks or {})
+    ds.close()
     if tmpdir is None:
         logger.debug(f"Adding finalizer for {target}")
         weakref.finalize(ds._file_obj._manager, noisy_unlink, target)
