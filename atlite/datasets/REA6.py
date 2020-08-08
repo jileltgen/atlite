@@ -1,30 +1,36 @@
+"""
+Module containing specific operations for creating cutouts from the REA6 dataset.
+"""
+
+from ..gis import regrid, maybe_swap_spatial_dims
+from rasterio.warp import Resampling
 import os
+import glob
 import pandas as pd
 import numpy as np
 import xarray as xr
-
-from dask import delayed
-
-from tempfile import mkstemp
-
-import cdsapi
-
-
-
+from functools import partial
+from datetime import datetime
 
 import logging
 logger = logging.getLogger(__name__)
 
-# Model and Projection Settings
+# Model, Projection and Resolution Settings
 projection = 'latlong'
+dx = 0.12939683446344338
+dy = 0.06118376358695652
+dt = '1H'
 
 features = {
     'height': ['height'],
     'wind': [
-        'wnd10m'],
+        'wnd100m',
+        'roughness'],
     'influx': [
+        'influx_toa',
         'influx_direct',
-        'influx_diffuse'],
+        'influx_diffuse',
+        'albedo'],
     'temperature': [
         'temperature',
         'soil temperature'],
@@ -32,135 +38,126 @@ features = {
 
 static_features = {'height'}
 
+def _rename_and_clean_coords(ds, add_lon_lat=True):
+    """Rename 'longitude' and 'latitude' columns to 'x' and 'y'.
 
-
-
-def _area(coords):
-    # North, West, South, East. Default: global
-    x0, x1 = coords['x'].min().item(), coords['x'].max().item()
-    y0, y1 = coords['y'].min().item(), coords['y'].max().item()
-    return [y1, x0, y0, x1]
-
-
-def retrieval_times(coords):
+    Optionally (add_lon_lat, default:True) preserves latitude and longitude
+    columns as 'lat' and 'lon'.
     """
-    Get list of retrieval cdsapi arguments for time dimension in coordinates.
+    ds = ds.rename({'longitude': 'x', 'latitude': 'y'})
+    ds = maybe_swap_spatial_dims(ds)
+    if add_lon_lat:
+        ds = ds.assign_coords(lon=ds.coords['x'], lat=ds.coords['y'])
+    return ds
 
-    According to the time span in the coords argument, the entries in the list
-    specify either
+def get_filenames(rea_dir, coords):
+    """
+    Get all files in directory `rea_dir` relevent for coordinates `coords`.
 
-    * days, if number of days in coords is less or equal 10
-    * months, if number of days is less or equal 90
-    * years else
+    This function parses all files in the rea directory which lay in the time
+    span of the coordinates.
 
     Parameters
     ----------
+    rea_dir : str
     coords : atlite.Cutout.coords
 
     Returns
     -------
-    list of dicts witht retrieval arguments
+    pd.DataFrame with two columns `sis` and `sid` for and timeindex for all
+    relevant files.
+    """
+    def _filenames_starting_with(name):
+        pattern = os.path.join(rea_dir, "**", f"{name}*.nc")
+        files = pd.Series(glob.glob(pattern, recursive=True))
+        assert not files.empty, (f"No files found at {pattern}. Make sure "
+                                 "rea_dir points to the correct directory!")
+
+        files.index = pd.to_datetime(files.str.extract(r".*2D.(\d{6})",
+                                                       expand=False)+"01")
+        return files.sort_index()
+    files = pd.concat(dict(runoff=_filenames_starting_with("RUNOFF_S"),
+                           dif_rad=_filenames_starting_with("SWDIFDS_RAD"),
+                           dir_rad=_filenames_starting_with("SWDIRS_RAD"),
+                           t2m=_filenames_starting_with("T_2M"),
+                           u_10m=_filenames_starting_with("U_10M"),
+                           v_10m=_filenames_starting_with("V_10M")),
+                      join="inner", axis=1)
+
+    start = coords['time'].to_index()[0]
+    end = datetime(
+        coords['time'].to_index()[-1].year, 
+        coords['time'].to_index()[-1].month,
+        1)
+
+    if (start < files.index[0]) or (end.date() > files.index[-1]):
+        logger.error(f"Files in {rea_dir} do not cover the whole time span:"
+                     f"\n\t{start} until {end}")
+
+    return files.loc[(files.index >= start) & (files.index <= end)].sort_index()
+
+def as_slice(zs, pad=True):
+    """Convert index to slice. This speeds up the indexing."""
+    if not isinstance(zs, slice):
+        first, second, last = np.asarray(zs)[[0, 1, -1]]
+        dz = 0.1 * (second - first) if pad else 0.
+        zs = slice(first - dz, last + dz)
+    return zs
+
+def get_data(cutout, feature, tmpdir, lock=None, **creation_parameters):
+    """
+    Load stored REA6 data and reformat to matching the given cutout.
+
+    This function loads and resamples the stored REA6 data for a given
+    `atlite.Cutout`.
+
+    Parameters
+    ----------
+    cutout : atlite.Cutout
+    feature : str
+        Name of the feature data to retrieve. Must be in
+        `atlite.datasets.REA6.features`
+    **creation_parameters :
+        Mandatory arguments are:
+            * 'rea_dir', str. Directory of the stored SARAH data.
+        Possible arguments are:
+            * 'parallel', bool. Whether to load stored files in parallel
+            mode. Default is False.
+            
+    Returns
+    -------
+    xarray.Dataset
+        Dataset of dask arrays of the retrieved variables.
 
     """
-    time = pd.Series(coords['time'])
-    time_span = time.iloc[-1] - time.iloc[0]
-    if len(time) == 1:
-        return [{'year': str(d.year), 'month': str(d.month), 'day': str(d.day),
-                 'time': d.strftime("%H:00")} for d in time]
-    if time_span.days <= 10:
-        return [{'year': str(d.year), 'month': str(d.month), 'day': str(d.day)}
-                for d in time.dt.date.unique()]
-    elif time_span.days < 90:
-        return [{'year': str(year), 'month': str(month)}
-                for month in time.dt.month.unique()
-                for year in time.dt.year.unique()]
-    else:
-        return [{'year': str(year)} for year in time.dt.year.unique()]
-
-
-
-
-
-def retrieve_data(product, chunks=None, tmpdir=None, lock=None, **updates):
-    """Download data like ERA5 from the Climate Data Store (CDS)."""
-    # Default request
-    request = {
-        'product_type': 'reanalysis',
-        'format': 'netcdf',
-        'day': list(range(1, 31 + 1)),
-        'time': [
-            '00:00', '01:00', '02:00', '03:00', '04:00', '05:00',
-            '06:00', '07:00', '08:00', '09:00', '10:00', '11:00',
-            '12:00', '13:00', '14:00', '15:00', '16:00', '17:00',
-            '18:00', '19:00', '20:00', '21:00', '22:00', '23:00'
-        ],
-        'month': list(range(1, 12 + 1)),
-        # 'area': [50, -1, 49, 1], # North, West, South, East. Default: global
-        # 'grid': [0.25, 0.25], # Latitude/longitude grid: east-west (longitude)
-        # and north-south resolution (latitude). Default: 0.25 x 0.25
-    }
-    request.update(updates)
-
-    assert {'year', 'month', 'variable'}.issubset(
-        request), "Need to specify at least 'variable', 'year' and 'month'"
-
-    result = cdsapi.Client().retrieve(product, request)
-
-    fd, target = mkstemp(suffix='.nc', dir=tmpdir)
-    os.close(fd)
-
-    try:
-        if lock is not None:
-            lock.acquire()
-        result.download(target)
-    finally:
-        if lock is not None:
-            lock.release()
-
-    ds = xr.open_dataset(target, chunks=chunks or {})
-
-
-    return ds
-
-
-def get_data(cutout, feature, tmpdir, lock, **creation_parameters):
-
-    ds = xr.open_mfdataset('/Users/jileltgen/Downloads/testrea6/*.nc',
-                  data_vars='minimal', coords='minimal', compat='override')
-    ds = ds.drop_vars({'rotated_pole', 'depth', 'depth_bnds', 'height'})
-    ds = ds.rename({'rlon': 'x', 'rlat': 'y', 'height': 'oldheight', 'var90': 'runoff', 'var22': 'influx_direct', 'var23': 'influx_diffuse',
-                'var85': 'soil temperature', 'var156': 'height', 'var11': 'temperature'})
-    ds['wnd10m'] = np.sqrt(ds['var33']**2 + ds['var34']**2)
-    ds = ds.drop_vars(['var33', 'var34'])
-    ds['soil temperature'] = 273.15 - ds['soil temperature']
-    ds['temperature'] = 273.15 - ds['temperature']
-   
+    assert cutout.dt in ('h', 'H', '1h', '1H')
 
     coords = cutout.coords
+    chunks = cutout.chunks
 
-    sanitize = creation_parameters.get('sanitize', True)
+    rea_dir = creation_parameters['rea_dir']
+    creation_parameters.setdefault('parallel', False)
 
-    retrieval_params = {'product': 'reanalysis-era5-single-levels',
-                        'area': _area(coords),
-                        'chunks': cutout.chunks,
-                        'grid': [cutout.dx, cutout.dy],
-                        'tmpdir': tmpdir,
-                        'lock': lock}
+    files = get_filenames(rea_dir, coords)
+    open_kwargs = dict(chunks=chunks, parallel=creation_parameters['parallel'])
+    #ds_runoff = xr.open_mfdataset(files.runoff, combine='by_coords', **open_kwargs)
+    ds_dif_rad = xr.open_mfdataset(files.dif_rad, combine='by_coords', **open_kwargs)
+    ds_dir_rad = xr.open_mfdataset(files.dir_rad, combine='by_coords', **open_kwargs)
+    ds_t2m = xr.open_mfdataset(files.t2m, combine='by_coords', **open_kwargs)
+    ds_u_10m = xr.open_mfdataset(files.u_10m, combine='by_coords', **open_kwargs)
+    ds_v_10m = xr.open_mfdataset(files.v_10m, combine='by_coords', **open_kwargs)
+    
+    ds = xr.merge([ds_dif_rad, ds_dir_rad, ds_t2m, ds_u_10m, ds_v_10m]) # ds_runoff, 
+    ds = ds.sel(lon=as_slice(coords['lon']), lat=as_slice(coords['lat']))
 
-    func = globals().get(f"get_data_{feature}")
-    sanitize_func = globals().get(f"sanitize_{feature}")
+    ds = ds.fillna(0)
 
-    logger.info(f"Downloading data for feature '{feature}' to {tmpdir}.")
+    if (cutout.dx != dx) or (cutout.dy != dy):
+        ds = regrid(ds, coords['lon'], coords['lat'], resampling=Resampling.average)
 
-    def retrieve_once(time):
-        ds = delayed(func)({**retrieval_params, **time})
-        if sanitize and sanitize_func is not None:
-            ds = delayed(sanitize_func)(ds)
-        return ds
-
-    if feature in static_features:
-        return retrieve_once(retrieval_times(coords)[0])
-
-    datasets = map(retrieve_once, retrieval_times(coords))
-
-    return delayed(xr.concat)(datasets, dim='time')
+    #dif_attrs = dict(long_name='Surface Diffuse Shortwave Flux', units='W m-2')
+    #ds['influx_diffuse'] = (ds['SIS'] - ds['SID']) .assign_attrs(**dif_attrs)
+    #ds = ds.rename({'SID': 'influx_direct'}).drop_vars('SIS')
+    ds = ds.assign_coords(x=ds.coords['lon'], y=ds.coords['lat'])
+    ds = _rename_and_clean_coords(ds)
+    return ds.swap_dims({'lon': 'x', 'lat':'y'})

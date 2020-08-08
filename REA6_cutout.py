@@ -11,13 +11,14 @@ import atlite
 import logging
 logging.basicConfig(level=logging.INFO)
 
-cutout = atlite.Cutout(path="western-europe-1995.nc",
+cutout = atlite.Cutout(path="western-europe-2018.nc",
+                       rea_dir=r"F:\weather_data\REA",
                        module="REA6",
-                       x=slice(-19.0, 45.0),
-                       y=slice(33.0, 75.0),
-                       dx = 0.055,
-                       dy = 0.055,
-                       time="1995",
+                       x=slice(-44.67010498046875, 65.05841064453124),
+                       y=slice(21.95256, 72.36798119565216),
+                       dx = 0.12939683446344338,
+                       dy =  0.06118376358695652,
+                       time="2018",
                        chunks={'time': 100}
                        )
 
