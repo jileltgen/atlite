@@ -109,7 +109,7 @@ def cutout_prepare(cutout, features=slice(None), tmpdir=None, overwrite=False):
         keep_tmpdir = True
 
     modules = atleast_1d(cutout.module)
-    features = atleast_1d(features)
+    #features = atleast_1d(features)
     prepared = set(cutout.data.attrs['prepared_features'])
 
     # target is series of all available variables for given module and features
