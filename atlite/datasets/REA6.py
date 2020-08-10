@@ -91,7 +91,7 @@ def get_filenames(rea_dir, coords):
         rea_dir, "constant", "COSMO_REA6_CONST_withOUTsponge.nc")
     start = coords['time'].to_index()[0]
     end = datetime(
-        coords['time'].to_index()[-1].year, 
+        coords['time'].to_index()[-1].year,
         coords['time'].to_index()[-1].month,
         1)
 
@@ -126,7 +126,7 @@ def get_data_wind(open_kwargs):
     return ds
 
 def get_data_roughness(open_kwargs):
-    return 
+    return
 
 def get_data_influx(open_kwargs):
     """Get influx data for given retrieval parameters."""
@@ -142,7 +142,7 @@ def get_data_influx(open_kwargs):
     ds['influx_toa'] =  ds['influx_direct'] + ds['influx_diffuse']
     ds['albedo'] = ((ds['SOBS_RAD']/ds['influx_toa'])
                     .assign_attrs(units='(0 - 1)', long_name='Albedo'))
-    
+
     ds = ds.drop_vars(['SOBS_RAD'])
     return ds
 
@@ -192,7 +192,7 @@ def get_data(cutout, feature, tmpdir, lock=None, **creation_parameters):
         Possible arguments are:
             * 'parallel', bool. Whether to load stored files in parallel
             mode. Default is False.
-            
+
     Returns
     -------
     xarray.Dataset
@@ -203,27 +203,29 @@ def get_data(cutout, feature, tmpdir, lock=None, **creation_parameters):
 
     coords = cutout.coords
     chunks = cutout.chunks
-    
+
     sanitize = creation_parameters.get('sanitize', True)
-    
+
     rea_dir = creation_parameters['rea_dir']
     creation_parameters.setdefault('parallel', False)
 
     files = get_filenames(rea_dir, coords)
     open_kwargs = dict(chunks=chunks, parallel=creation_parameters['parallel'],
                        files=files)
-    
+
     func = globals().get(f"get_data_{feature}")
     sanitize_func = globals().get(f"sanitize_{feature}")
     print(f"get_data_{feature}", func)
     # ds = func(open_kwargs)
     # if sanitize and sanitize_func is not None:
     #     ds = sanitize_func(ds)
-    def retrieve_once():
-        ds = delayed(func)(open_kwargs)
-        if sanitize and sanitize_func is not None:
-            ds = delayed(sanitize_func)(ds)
-        return ds
-    if feature in static_features:
-        return retrieve_once()
-    return delayed(xr.concat)(retrieve_once, dim='time')
+    # return ds
+    # def retrieve_once():
+    #     ds = delayed(func)(open_kwargs)
+    #     if sanitize and sanitize_func is not None:
+    #         ds = delayed(sanitize_func)(ds)
+    #     return ds
+    # if feature in static_features:
+    #     return retrieve_once()
+    datasets = map(func, open_kwargs)
+    return delayed(xr.concat)(datasets, dim='time')
