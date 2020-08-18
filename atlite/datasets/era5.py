@@ -150,8 +150,6 @@ def get_data_temperature(retrieval_params):
 
     ds = _rename_and_clean_coords(ds)
     ds = ds.rename({'t2m': 'temperature', 'stl4': 'soil temperature'})
-    ds['temperature'] = ds['temperature'] - 273.15
-    ds['soil temperature'] = ds['soil temperature'] - 273.15
 
     return ds
 
