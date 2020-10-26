@@ -2,7 +2,7 @@
 Module containing specific operations for creating cutouts from the REA6 dataset.
 """
 
-from ..gis import regrid, maybe_swap_spatial_dims
+from atlite.gis import regrid, maybe_swap_spatial_dims
 from rasterio.warp import Resampling
 import os
 import glob
@@ -25,22 +25,25 @@ dy = 0.06118376358695652
 dt = '1H'
 
 features = {
-    #'height': ['height'],
+    'height': ['height', 'roughness'],
     'wind': [
-        'wnd10m'], # ,'roughness'
+        'wnd10m'],
     'influx': [
-        'influx_toa',
         'influx_direct',
         'influx_diffuse',
         'albedo'],
     'temperature': [
         'temperature',
-        'soil temperature']}
-    # ,'runoff': ['runoff']}
+        'soil_temperature'],
+    'runoff': ['runoff']}
 
-static_features = {'height'}
+static_features = {'height'} 
 
-def _rename_and_clean_coords(ds, add_lon_lat=True):
+def _add_lat_lon(ds):
+    ds = ds.assign_coords(lon=ds.coords['x'], lat=ds.coords['y'])
+    return ds
+
+def _rename_and_clean_coords(ds, add_lon_lat=False):
     """Rename 'longitude' and 'latitude' columns to 'x' and 'y'.
 
     Optionally (add_lon_lat, default:True) preserves latitude and longitude
@@ -78,10 +81,11 @@ def get_filenames(rea_dir, coords):
         files.index = pd.to_datetime(files.str.extract(r".*2D.(\d{6})",
                                                        expand=False)+"01")
         return files.sort_index()
-    files = pd.concat(dict(runoff=_filenames_starting_with("RUNOFF_S"),
-                           dif_rad=_filenames_starting_with("SWDIFDS_RAD"),
-                           dir_rad=_filenames_starting_with("SWDIRS_RAD"),
-                           sobs_rad=_filenames_starting_with("SOBS_RAD"),
+    files = pd.concat(dict(runoff_s=_filenames_starting_with("RUNOFF_S"),
+                           runoff_g=_filenames_starting_with("RUNOFF_G"),
+                           dif_rad=_filenames_starting_with("ASWDIFD_S"),
+                           dir_rad=_filenames_starting_with("ASWDIR_S"),
+                           sobs_rad=_filenames_starting_with("ASOB_S"),
                            t2m=_filenames_starting_with("T_2M"),
                            tsoil=_filenames_starting_with("T_SOIL"),
                            u_10m=_filenames_starting_with("U_10M"),
@@ -112,67 +116,106 @@ def as_slice(zs, pad=True):
 def get_data_wind(open_kwargs):
     """Get wind data for given retrieval parameters."""
     files = open_kwargs.pop("files")
+    coords = open_kwargs.pop("coords")
     ds_u_10m = xr.open_mfdataset(files.u_10m, combine='by_coords', **open_kwargs)
+    ds_u_10m = ds_u_10m.isel(height=0, drop=True)
     ds_v_10m = xr.open_mfdataset(files.v_10m, combine='by_coords', **open_kwargs)
-    ds = xr.merge([ds_u_10m, ds_v_10m])
-
-    ds = _rename_and_clean_coords(ds, add_lon_lat=False)
+    ds_v_10m = ds_v_10m.isel(height=0, drop=True)
+    ds = xr.merge([ds_u_10m, ds_v_10m], compat='override') 
 
     ds['wnd10m'] = (np.sqrt(ds_u_10m['10u']**2 + ds_v_10m['10v']**2)
                      .assign_attrs(units=ds['10u'].attrs['units'],
-                                   long_name="10 metre wind speed"))
+                                   long_name="10 metre wind speed"))  
     ds = ds.drop_vars(['10u', '10v'])
-
+    ds = ds.sel(lon=as_slice(coords['x']), lat=as_slice(coords['y']))
+    ds = _rename_and_clean_coords(ds)
+    
     return ds
-
-def get_data_roughness(open_kwargs):
-    return
 
 def get_data_influx(open_kwargs):
     """Get influx data for given retrieval parameters."""
     files = open_kwargs.pop("files")
+    coords = open_kwargs.pop("coords")
     ds_dif_rad = xr.open_mfdataset(files.dif_rad, combine='by_coords', **open_kwargs)
     ds_dir_rad = xr.open_mfdataset(files.dir_rad, combine='by_coords', **open_kwargs)
     ds_sobs_rad = xr.open_mfdataset(files.sobs_rad, combine='by_coords', **open_kwargs)
     ds = xr.merge([ds_dif_rad, ds_dir_rad, ds_sobs_rad])
-    ds = _rename_and_clean_coords(ds)
     # Not sure if the variables are the right ones
-    ds = ds.rename({'SWDIRS_RAD': 'influx_direct',
-                    'SWDIFDS_RAD': 'influx_diffuse', 'var111': 'SOBS_RAD'})
-    ds['influx_toa'] =  ds['influx_direct'] + ds['influx_diffuse']
-    ds['albedo'] = ((ds['SOBS_RAD']/ds['influx_toa'])
+    ds = ds.rename(
+        {'var22': 'influx_direct', 'var23': 'influx_diffuse',
+         'var111': 'SOBS_RAD'})
+    ds['influx_total'] =  ds['influx_direct'] + ds['influx_diffuse']
+    ds['albedo'] = (1.-(ds['SOBS_RAD']/ds['influx_total'])
                     .assign_attrs(units='(0 - 1)', long_name='Albedo'))
 
-    ds = ds.drop_vars(['SOBS_RAD'])
+    ds = ds.drop_vars(['SOBS_RAD', 'influx_total'])
+    ds = ds.sel(lon=as_slice(coords['x']), lat=as_slice(coords['y']))
+    ds = _rename_and_clean_coords(ds)
+    return ds
+
+def sanitize_influx(ds):
+    """Sanitize retrieved inflow data."""
+    for a in ('influx_direct', 'influx_diffuse', 'albedo'):
+        ds[a] = ds[a].clip(min=0.)
     return ds
 
 def get_data_temperature(open_kwargs):
     """Get wind temperature for given retrieval parameters."""
     files = open_kwargs.pop("files")
+    coords = open_kwargs.pop("coords")
     ds_t2m = xr.open_mfdataset(files.t2m, combine='by_coords', **open_kwargs)
+    ds_t2m = ds_t2m.isel(height=0, drop=True)
     ds_tsoil = xr.open_mfdataset(files.tsoil, combine='by_coords', **open_kwargs)
-    ds = xr.merge([ds_t2m, ds_tsoil])
+    ds_tsoil = ds_tsoil.isel(depth=0, drop=True)
+    ds = xr.merge([ds_t2m, ds_tsoil], compat='override')
+    ds = ds.rename({'2t': 'temperature', 'var85': 'soil_temperature'})
+    ds = ds.sel(lon=as_slice(coords['x']), lat=as_slice(coords['y']))
     ds = _rename_and_clean_coords(ds)
-    ds = ds.rename({'2t': 'temperature', 'var85': 'soil temperature'})
     return ds
 
-# def get_data_runoff(open_kwargs):
-#     """Get runoff data for given retrieval parameters."""
-#     ds = retrieve_data(variable=['runoff'], **open_kwargs)
-
-#     ds = _rename_and_clean_coords(ds)
-#     ds = ds.rename({'ro': 'runoff'})
-
-#     return ds
+def get_data_runoff(open_kwargs):
+    """Get runoff data for given retrieval parameters."""
+    files = open_kwargs.pop("files")
+    coords = open_kwargs.pop("coords")
+    runoff_s = xr.open_mfdataset(
+        files.runoff_s, combine='by_coords', **open_kwargs)
+    runoff_s = runoff_s.isel(depth=0, drop=True)
+    runoff_s = runoff_s.rename({'var90': 'runoff_s'})
+    runoff_g = xr.open_mfdataset(
+        files.runoff_g, combine='by_coords', **open_kwargs)
+    runoff_g = runoff_g.isel(depth=0, drop=True)
+    runoff_g = runoff_g.rename({'var90': 'runoff_g'})
+    ds = xr.merge([runoff_s, runoff_g], compat='override')
+    # TODO: Check which variables to use for runoff units don't fit to ERA5
+    ds["runoff"] = (ds["runoff_s"] + ds["runoff_g"]) / (1000. / 24.)
+    ds = ds.drop_vars(['runoff_s', 'runoff_g', 'depth_bnds'])
+    ds = ds.sel(lon=as_slice(coords['x']), lat=as_slice(coords['y']))
+    ds = _rename_and_clean_coords(ds)
+    return ds
 
 def get_data_height(open_kwargs):
     """Get height data for given retrieval parameters."""
     rea_dir = open_kwargs.pop("rea_dir")
-    file = os.path.join(rea_dir, "constant", "COSMO_REA6_CONST_withOUTsponge.nc")
+    file = os.path.join(
+        rea_dir, "constant", "COSMO_REA6_CONST_withOUTsponge_converted.nc")
+    coords = open_kwargs.pop("coords")
     ds = xr.open_dataset(file)
-    #ds = _rename_and_clean_coords(ds)
+    ds = ds[["Z0", "HSURF"]]
+    ds = ds.rename({'Z0': 'roughness', 'HSURF': 'height'})
+    ds = ds.sel(lon=as_slice(coords['x']), lat=as_slice(coords['y']))
+    ds = _rename_and_clean_coords(ds)
     return ds
 
+
+def regrid_ds(ds, coords):
+    datasets = []
+    for data_str in ds:
+        data_array = ds[data_str]
+        datasets.append(regrid(
+            data_array, coords['x'], coords['y'],
+            resampling=Resampling.average))
+    return xr.merge(datasets)
+    
 def get_data(cutout, feature, tmpdir, lock=None, **creation_parameters):
     """
     Load stored REA6 data and reformat to matching the given cutout.
@@ -210,22 +253,19 @@ def get_data(cutout, feature, tmpdir, lock=None, **creation_parameters):
     creation_parameters.setdefault('parallel', False)
 
     files = get_filenames(rea_dir, coords)
-    open_kwargs = dict(chunks=chunks, parallel=creation_parameters['parallel'],
-                       files=files)
+    
+    open_kwargs = dict(
+        chunks=chunks, parallel=creation_parameters['parallel'], files=files,
+        coords=coords)
+    if feature in static_features:
+        open_kwargs["rea_dir"] = rea_dir
 
     func = globals().get(f"get_data_{feature}")
     sanitize_func = globals().get(f"sanitize_{feature}")
-    print(f"get_data_{feature}", func)
-    # ds = func(open_kwargs)
-    # if sanitize and sanitize_func is not None:
-    #     ds = sanitize_func(ds)
-    # return ds
-    # def retrieve_once():
-    #     ds = delayed(func)(open_kwargs)
-    #     if sanitize and sanitize_func is not None:
-    #         ds = delayed(sanitize_func)(ds)
-    #     return ds
-    # if feature in static_features:
-    #     return retrieve_once()
-    datasets = map(func, open_kwargs)
-    return delayed(xr.concat)(datasets, dim='time')
+    ds = delayed(func)(open_kwargs)
+    if sanitize and sanitize_func is not None:
+        ds = delayed(sanitize_func)(ds)
+    if (cutout.dx != dx) or (cutout.dy != dy):
+        ds = delayed(regrid_ds)(ds, coords)
+        ds = delayed(_add_lat_lon)(ds)
+    return ds
