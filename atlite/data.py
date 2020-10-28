@@ -6,11 +6,11 @@
 
 import pandas as pd
 import xarray as xr
+import os
 from numpy import atleast_1d
-from tempfile import mkdtemp
+from tempfile import mkstemp, mkdtemp
 from shutil import rmtree
-import dask
-from dask.delayed import Delayed
+from dask import delayed, compute
 from dask.utils import SerializableLock
 from dask.diagnostics import ProgressBar
 import logging
@@ -32,11 +32,11 @@ def get_features(cutout, module, features, tmpdir=None):
     get_data = datamodules[module].get_data
 
     for feature in features:
-        feature_data = get_data(cutout, feature, tmpdir=tmpdir, lock=lock, **parameters)
+        feature_data = delayed(get_data)(cutout, feature, tmpdir=tmpdir,
+                                         lock=lock, **parameters)
         datasets.append(feature_data)
 
-    if len(datasets) >= 1 and isinstance(datasets[0], Delayed):
-        datasets = dask.compute(*datasets)
+    datasets = compute(*datasets)
 
     ds = xr.merge(datasets, compat='equals')
     for v in ds:
@@ -68,6 +68,11 @@ def available_features(module=None):
     if module is not None:
         features = features.reindex(atleast_1d(module), level='module')
     return features.explode()
+
+
+def non_bool_dict(d):
+    """Convert bool to int for netCDF4 storing"""
+    return {k: v if not isinstance(v, bool) else int(v) for k,v in d.items()}
 
 
 def cutout_prepare(cutout, features=slice(None), tmpdir=None, overwrite=False):
@@ -108,44 +113,60 @@ def cutout_prepare(cutout, features=slice(None), tmpdir=None, overwrite=False):
     else:
         keep_tmpdir = True
 
-    modules = atleast_1d(cutout.module)
-    #features = atleast_1d(features)
-    prepared = set(cutout.data.attrs['prepared_features'])
+    ds = None
 
-    # target is series of all available variables for given module and features
-    target = available_features(modules).loc[:, features].drop_duplicates()
+    try:
+        logger.info(f'Storing temporary files in {tmpdir}')
 
-    for module in target.index.unique('module'):
-        missing_vars = target[module]
-        if not overwrite:
-            missing_vars = missing_vars[lambda v: ~v.isin(cutout.data)]
-        if missing_vars.empty:
-            continue
-        logger.info(f'Calculating and writing with module {module}:')
-        missing_features = missing_vars.index.unique('feature')
-        ds = get_features(cutout, module, missing_features, tmpdir=tmpdir)
-        # make sure we don't loose any unused dimension by selecting
-        ds = ds[missing_vars.values].assign_coords(ds.coords)
+        modules = atleast_1d(cutout.module)
+        features = atleast_1d(features)
+        prepared = set(atleast_1d(cutout.data.attrs['prepared_features']))
 
-        ds = ds.assign_attrs(**cutout.data.attrs)
-        prepared |= set(missing_features)
-        ds = ds.assign_attrs(prepared_features = list(prepared))
-        # convert bool to int for netCDF4 storing
-        ds.attrs.update({k: v if not isinstance(v, bool) else int(v)
-                         for k,v in ds.attrs.items()})
+        # target is series of all available variables for given module and features
+        target = available_features(modules).loc[:, features].drop_duplicates()
 
-        with ProgressBar():
+        for module in target.index.unique('module'):
+            missing_vars = target[module]
+            if not overwrite:
+                missing_vars = missing_vars[lambda v: ~v.isin(cutout.data)]
+            if missing_vars.empty:
+                continue
+            logger.info(f'Calculating and writing with module {module}:')
+            missing_features = missing_vars.index.unique('feature')
+            ds = get_features(cutout, module, missing_features, tmpdir=tmpdir)
+            prepared |= set(missing_features)
+
+            cutout.data.attrs.update(dict(prepared_features=list(prepared)))
+            ds = (cutout.data.merge(ds[missing_vars.values])
+                  .assign_attrs(**non_bool_dict(cutout.data.attrs), **ds.attrs))
+
+            # write data to tmp file, copy it to original data, this is much safer
+            # than appending variables
+            directory, filename = os.path.split(str(cutout.path))
+            fd, tmp = mkstemp(suffix=filename, dir=directory)
+            os.close(fd)
+
+            with ProgressBar():
+                ds.to_netcdf(tmp)
+            ds.close()
+
+            # make sure we are only closing data, if it points to the file
+            # we want to update
+            if (cutout.data._file_obj is not None and
+                cutout.data._file_obj._filename == str(cutout.path.resolve())):
+                cutout.data.close()
+
             if cutout.path.exists():
-                mode = 'a'
-            else:
-                mode = 'w'
+                cutout.path.unlink()
+            os.rename(tmp, cutout.path)
 
-            ds.to_netcdf(cutout.path, mode=mode)
+            cutout.data = xr.open_dataset(cutout.path, chunks=cutout.chunks)
 
-    if not keep_tmpdir:
-        rmtree(tmpdir)
+    finally:
+        if ds is not None:
+            ds.close()
 
-    cutout.data = xr.open_dataset(cutout.path, chunks=cutout.chunks)
+        if not keep_tmpdir:
+            rmtree(tmpdir)
 
     return cutout
-

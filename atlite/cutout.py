@@ -20,6 +20,7 @@ Base class for Atlite.
 import xarray as xr
 import pandas as pd
 import numpy as np
+from tempfile import mktemp
 from numpy import atleast_1d
 from warnings import warn
 from shapely.geometry import box
@@ -124,7 +125,7 @@ class Cutout:
                 "`cutout_dir` and `name` have been deprecated in favour of `path`.")
 
         path = Path(path).with_suffix(".nc")
-        chunks = cutoutparams.pop('chunks', {'time': 20})
+        chunks = cutoutparams.pop('chunks', {'time': 100})
         storable_chunks = {f'chunksize_{k}': v for k, v in (chunks or {}).items()}
 
         # Backward compatibility for xs, ys, months and years
@@ -237,11 +238,13 @@ class Cutout:
 
     @property
     def dx(self):
-        return (self.coords['x'][1] - self.coords['x'][0]).item()
+        x = self.coords['x']
+        return (x[-1] - x[0]).item() / (x.size - 1)
 
     @property
     def dy(self):
-        return (self.coords['y'][1] - self.coords['y'][0]).item()
+        y = self.coords['y']
+        return (y[-1] - y[0]).item() / (y.size - 1)
 
     @property
     def dt(self):
@@ -274,16 +277,18 @@ class Cutout:
                       for c in np.hstack((coords - span, coords + span))]
         return grid_cells
 
-    def sel(self, **kwargs):
-        if 'bounds' in kwargs:
-            bounds = kwargs.pop('bounds')
-            buffer = kwargs.pop('buffer', 0)
+    def sel(self, path=None, bounds=None, buffer=0, **kwargs):
+        if path is None:
+            path = mktemp(prefix=f"{self.path.stem}-", suffix=self.path.suffix,
+                          dir=self.path.parent)
+
+        if bounds is not None:
             if buffer > 0:
                 bounds = box(*bounds).buffer(buffer).bounds
             x1, y1, x2, y2 = bounds
             kwargs.update(x=slice(x1, x2), y=slice(y1, y2))
         data = self.data.sel(**kwargs)
-        return Cutout(self.path.name, data=data)
+        return Cutout(path, data=data)
 
     def __repr__(self):
         start = np.datetime_as_string(self.coords['time'].values[0], unit='D')
