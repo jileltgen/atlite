@@ -119,7 +119,7 @@ def cutout_prepare(cutout, features=slice(None), tmpdir=None, overwrite=False):
         logger.info(f'Storing temporary files in {tmpdir}')
 
         modules = atleast_1d(cutout.module)
-        features = atleast_1d(features)
+        #features = atleast_1d(features)
         prepared = set(atleast_1d(cutout.data.attrs['prepared_features']))
 
         # target is series of all available variables for given module and features
